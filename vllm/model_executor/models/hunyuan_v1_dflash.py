@@ -152,7 +152,7 @@ class DFlashHunYuanAttention(nn.Module):
 
         Note: RoPE is applied before QK-Norm.
         """
-        qkv = F.linear(hidden_states, self.qkv_proj.weight, self.qkv_proj.bias)
+        qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # HunyuanVL: RoPE first, then QK-Norm
@@ -329,6 +329,19 @@ class DFlashHunYuanModel(nn.Module):
         layers_attn = [layer.self_attn for layer in self.layers]
         attn0 = layers_attn[0]
         has_bias = attn0.qkv_proj.bias is not None
+
+        # The fused KV path below uses F.linear directly on stacked raw weight
+        # tensors, which bypasses any quant_method dispatch. Refuse to build the
+        # fused buffers when a quantized draft is configured so we fail loudly
+        # instead of silently producing wrong results. Quantization-aware fusion
+        # is not yet implemented for this path.
+        if self.quant_config is not None:
+            raise NotImplementedError(
+                "DFlash fused context KV projection does not support quantized "
+                "draft models yet (quant_config must be None). The fused GEMM "
+                "in precompute_and_store_context_kv calls F.linear directly on "
+                "stacked qkv_proj weights and would bypass quantization."
+            )
 
         self._hidden_norm_weight = self.hidden_norm.weight.data
 
@@ -595,6 +608,11 @@ class DFlashHunYuanV1ForCausalLM(nn.Module):
         logits = self.logits_processor(self.lm_head, hidden_states)
         if self.draft_id_to_target_id is None:
             return logits
+        # draft_id_to_target_id stores *offsets* (a.k.a. d2t), not absolute
+        # target IDs: draft_id_to_target_id[i] = target_id - i.
+        # So  base[i] + offset[i] = i + (target_id - i) = target_id  ✓
+        # This matches the convention used in qwen3_dflash.py (the weight is
+        # renamed from `d2t` -> `draft_id_to_target_id` during loading).
         base = torch.arange(self.config.draft_vocab_size, device=logits.device)
         targets = base + self.draft_id_to_target_id
         logits_new = logits.new_full(
